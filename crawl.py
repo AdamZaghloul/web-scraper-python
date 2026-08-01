@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup, Tag
 
 class AsyncCrawler():
 
-    def __init__(self, base_url, max_concurrency):
+    def __init__(self, base_url, max_concurrency, max_pages):
         self.base_url = base_url
         self.base_domain =urllib.parse.urlsplit(base_url).hostname
         self.page_data = {}
@@ -11,6 +11,9 @@ class AsyncCrawler():
         self.max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.session = None
+        self.max_pages = max_pages
+        self.should_stop = False
+        self.all_tasks = set()
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -20,11 +23,28 @@ class AsyncCrawler():
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.session.close()
 
-    async def add_page_visit(self, normalized_url):
+    async def add_page_visit(self, normalized_url: str):
         async with self.lock:
+
+            if self.should_stop:
+                return False
+
+            if len(self.page_data) >= self.max_pages:
+                self.should_stop = True
+                print("Reached maximum number of pages to crawl.")
+                #current = asyncio.current_task()
+
+                #for task in list(self.all_tasks):
+                #    if task == current:
+                #        continue
+                #    task.cancel()
+
+                return False
+
             if normalized_url in self.page_data:
                 return False
 
+            print(f"Crawling {normalized_url}")
             self.page_data[normalized_url] = {}
             return True
 
@@ -42,6 +62,9 @@ class AsyncCrawler():
     async def crawl_page(self, base_url, current_url=None):
         if not is_same_domain(base_url, current_url):
             return
+        
+        if self.should_stop:
+            return
 
         norm_current = normalize_url(current_url)
 
@@ -50,24 +73,37 @@ class AsyncCrawler():
 
         async with self.semaphore:
 
-            print(f"Getting html from {norm_current}")
             html = await self.get_html(norm_current)
 
         async with self.lock:
             self.page_data[norm_current] = extract_page_data(html, norm_current)
 
-        tasks = []
+        if self.should_stop:
+            return
 
         for link in self.page_data[norm_current]["outgoing_links"]:
-            tasks.append(asyncio.create_task(self.crawl_page(base_url, link)))
-        
-        await asyncio.gather(*tasks)
+            if self.should_stop:
+                return
+            
+            self.all_tasks.add(asyncio.create_task(self.run_child(base_url, link)))
 
     async def crawl(self):
 
         await self.crawl_page(self.base_url, self.base_url)
 
+        while self.all_tasks:
+            tasks = list(self.all_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.all_tasks.difference_update(task for task in tasks if task.done())
+
         return self.page_data
+
+    async def run_child(self, base_url, link):
+        task = asyncio.current_task()
+        try:
+            await self.crawl_page(base_url, link)
+        finally:
+            self.all_tasks.discard(task)
 
 def normalize_url(url: str):
     split = urllib.parse.urlsplit(url)
@@ -112,7 +148,7 @@ def get_urls_from_html(html, base_url):
         return links
 
     except:
-        return Exception("Error")
+        raise Exception("Error")
 
 def get_images_from_html(html, base_url):
     try:
@@ -126,7 +162,7 @@ def get_images_from_html(html, base_url):
         return links
 
     except:
-        return Exception("Error")
+        raise Exception("Error")
 
 def extract_page_data(html: str, page_url: str):
     page_dic = {}
@@ -148,8 +184,8 @@ def is_same_domain(url1, url2)  -> bool:
 
     return False
 
-async def crawl_site_async(url, max_concurrency):
-    crawler = AsyncCrawler(normalize_url(url), max_concurrency)
+async def crawl_site_async(url, max_concurrency, max_pages):
+    crawler = AsyncCrawler(normalize_url(url), max_concurrency, max_pages)
 
     async with crawler:
 
